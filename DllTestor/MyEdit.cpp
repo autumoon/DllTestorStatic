@@ -5,6 +5,8 @@
 #include "DllTestor.h"
 #include "MyEdit.h"
 
+#include <vector>
+
 
 // CMyEdit
 
@@ -27,6 +29,12 @@ END_MESSAGE_MAP()
 
 // CMyEdit 消息处理程序
 
+void CMyEdit::PreSubclassWindow()
+{
+	CEdit::PreSubclassWindow();
+	DragAcceptFiles(TRUE);
+}
+
 void CMyEdit::OnDropFiles(HDROP hDropInfo)
 {
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
@@ -42,41 +50,42 @@ void CMyEdit::OnDropFiles(HDROP hDropInfo)
 		}
 
 		// 被拖拽的文件的文件名
-		TCHAR* szItemPath = new TCHAR[MAX_PATH + 1]();
+		std::vector<TCHAR> szItemPath(MAX_PATH, 0);
 
 		CString strAllPath;
 		for (UINT i = 0; i < nDrag; ++i)
 		{
-			memset(szItemPath, 0, sizeof(TCHAR) * (MAX_PATH + 1));
-			DragQueryFile(hDropInfo, i, szItemPath, MAX_PATH);
-			if (PathFileExists(szItemPath) == TRUE)
+			DragQueryFile(hDropInfo, i, szItemPath.data(), (UINT)szItemPath.size());
+			if (PathFileExists(szItemPath.data()) == TRUE)
 			{
+				bool bAdd = false;
 				//根据类型判断
-				if ((m_nFlag & EDIT_DIR_JUDGE) && PathIsDirectory(szItemPath))
+				if ((m_nFlag & (EDIT_DIR_JUDGE | EDIT_FILE_JUDGE)) == 0)
 				{
-					strAllPath += szItemPath;
+					bAdd = true;
 				}
-				else if ((m_nFlag & EDIT_FILE_JUDGE) && !PathIsDirectory(szItemPath))
+				else if ((m_nFlag & EDIT_DIR_JUDGE) && PathIsDirectory(szItemPath.data()))
 				{
-					strAllPath += szItemPath;
+					bAdd = true;
 				}
-				else if (m_nFlag == EDIT_NONE_JUDGE)
+				else if ((m_nFlag & EDIT_FILE_JUDGE) && !PathIsDirectory(szItemPath.data()))
 				{
-					strAllPath += szItemPath;
+					bAdd = true;
 				}
 
-				//超一个项目的时添加间隔符
-				if (nDrag > 1)
+				if (bAdd)
 				{
-					strAllPath += ";";
+					//多个项目时，前面已经有内容才添加间隔符
+					if (strAllPath.GetLength() > 0)
+					{
+						strAllPath += _T(";");
+					}
+					strAllPath += szItemPath.data();
 				}
 			}
-
-			SetWindowText(strAllPath);
 		}
 
-		delete[] szItemPath;
-		szItemPath = nullptr;
+		SetWindowText(strAllPath);
 	}
-	CEdit::OnDropFiles(hDropInfo);
+	DragFinish(hDropInfo);
 }

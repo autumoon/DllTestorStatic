@@ -191,6 +191,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\Common\tvmain\tvmain.h" />
+    <ClInclude Include="BuildConfig.h" />
     <ClInclude Include="DllTestor.h" />
     <ClInclude Include="DllTestorDlg.h" />
     <ClInclude Include="Resource.h" />

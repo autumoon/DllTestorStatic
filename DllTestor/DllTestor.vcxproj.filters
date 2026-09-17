@@ -39,6 +39,9 @@
     </None>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="BuildConfig.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="DllTestor.h">
       <Filter>头文件</Filter>
     </ClInclude>

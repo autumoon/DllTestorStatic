@@ -24,6 +24,7 @@ protected:
 	DECLARE_MESSAGE_MAP()
 public:
 	afx_msg void OnDropFiles(HDROP hDropInfo);
+	virtual void PreSubclassWindow();
 
 private:
 	int m_nFlag;

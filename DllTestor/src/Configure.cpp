@@ -2,7 +2,7 @@
 //mail:autumoon@vip.qq.com
 #include "Configure.h"
 
-inline _tstring VectorToString(const std::vector<_tstring>& vStrings)
+_tstring VectorToString(const std::vector<_tstring>& vStrings)
 {
 	_tstring strRes;
 
@@ -22,6 +22,20 @@ inline _tstring VectorToString(const std::vector<_tstring>& vStrings)
 	return strRes;
 }
 
+static std::vector<_tstring> FilterEmptyStrings(const std::vector<_tstring>& vStrings)
+{
+	std::vector<_tstring> vRes;
+	for (size_t i = 0; i < vStrings.size(); ++i)
+	{
+		if (vStrings[i].length() > 0)
+		{
+			vRes.push_back(vStrings[i]);
+		}
+	}
+
+	return vRes;
+}
+
 int ReadIniFile(const _tstring& strIniPath, config_s& _cfg)
 {
 	bool bRes = CStdFile::IfAccessFile(strIniPath.c_str());
@@ -30,21 +44,30 @@ int ReadIniFile(const _tstring& strIniPath, config_s& _cfg)
 	Ini.SetUnicode();
 	if (bRes)
 	{
+		if (Ini.LoadFile(strIniPath.c_str()) < 0)
+		{
+			Ini.Reset();
+			return 1;
+		}
+
 		//读取信息
-		Ini.LoadFile(strIniPath.c_str());
 		_cfg.bRemPath = Ini.GetBoolValue(INI_PRESUFFIX, INI_REMPATH, _cfg.bRemPath);
 
 		_tstring strDstDirs = VectorToString(_cfg.vDstPaths);
 		strDstDirs = Ini.GetValue(INI_PRESUFFIX, INI_DST_DIRS, strDstDirs.c_str());
-		_cfg.vDstPaths = CStdStr::Split(strDstDirs, _T("|"));
+		_cfg.vDstPaths = FilterEmptyStrings(CStdStr::Split(strDstDirs, _T("|")));
 
 		_tstring strAllItems = VectorToString(_cfg.vItemPaths);
 		strAllItems = Ini.GetValue(INI_PRESUFFIX, INI_ALL_ITEMS, strAllItems.c_str());
-		_cfg.vItemPaths = CStdStr::Split(strAllItems, _T("|"));
+		_cfg.vItemPaths = FilterEmptyStrings(CStdStr::Split(strAllItems, _T("|")));
 
 		_tstring strSuffixs = VectorToString(_cfg.vSuffixs);
 		strSuffixs = Ini.GetValue(INI_PRESUFFIX, INI_FILE_SUFFIXS, strSuffixs.c_str());
-		_cfg.vSuffixs = CStdStr::Split(strSuffixs, _T("|"));
+		_cfg.vSuffixs = FilterEmptyStrings(CStdStr::Split(strSuffixs, _T("|")));
+		if (_cfg.vSuffixs.size() == 0)
+		{
+			_cfg.vSuffixs.push_back(_T("*"));
+		}
 
 		_cfg.nWindowWidth = Ini.GetLongValue(INI_PRESUFFIX, INI_WIN_WIDTH, _cfg.nWindowWidth);
 		_cfg.nWindowHeight = Ini.GetLongValue(INI_PRESUFFIX, INI_WIN_HEIGHT, _cfg.nWindowHeight);
@@ -70,7 +93,12 @@ int WriteIniFile(const _tstring& strIniPath, const config_s& _cfg)
 	Ini.SetLongValue(INI_PRESUFFIX, INI_WIN_WIDTH, _cfg.nWindowWidth);
 	Ini.SetLongValue(INI_PRESUFFIX, INI_WIN_HEIGHT, _cfg.nWindowHeight);
 
-	Ini.SaveFile(strIniPath.c_str());
+	if (Ini.SaveFile(strIniPath.c_str()) < 0)
+	{
+		Ini.Reset();
+		return 1;
+	}
+
 	Ini.Reset();
 
 	return 0;

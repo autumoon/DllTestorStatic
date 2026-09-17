@@ -6,19 +6,40 @@
 #include "DllTestorDlg.h"
 #include "afxdialogex.h"
 
-/*同时支持处理文件和目录*/
-#if (defined ITEM_ONLY_DIR) && (defined ITEM_ONLY_FILE)
-#define ITEM_DIR_FILE
-#endif
+#include <algorithm>
+#include "Shlwapi.h"
 
-/*防止同时未定义*/
-#if (!defined ITEM_ONLY_DIR) && (!defined ITEM_ONLY_FILE)
-#error "One of ITEM_ONLY_DIR or ITEM_ONLY_FILE must be defined!"
+/*避免windows.h中的min/max宏干扰std::max/std::min*/
+#undef min
+#undef max
+
+#pragma comment(lib, "shlwapi.lib")
+
+#ifdef CMD_OUTPUT
+#include <io.h>
+#include <fcntl.h>
+#include <iostream>
 #endif
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
+
+//进度RAII保护，确保异常时也能正常结束进度显示
+class CProgressGuard
+{
+public:
+	explicit CProgressGuard(CProgressInterface* p) : m_p(p)
+	{
+		if (m_p) m_p->Start();
+	}
+	~CProgressGuard()
+	{
+		if (m_p) m_p->End();
+	}
+private:
+	CProgressInterface* m_p;
+};
 
 // 用于应用程序“关于”菜单项的 CAboutDlg 对话框
 
@@ -55,8 +76,19 @@ END_MESSAGE_MAP()
 
 CDllTestorDlg::CDllTestorDlg(CWnd* pParent /*=NULL*/)
 	: CDialogEx(CDllTestorDlg::IDD, pParent)
+	, m_hBgBitmap(NULL)
+	, m_eProcessMode(ProcessMode::File)
 {
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
+}
+
+CDllTestorDlg::~CDllTestorDlg()
+{
+	if (m_hBgBitmap)
+	{
+		::DeleteObject(m_hBgBitmap);
+		m_hBgBitmap = NULL;
+	}
 }
 
 void CDllTestorDlg::DoDataExchange(CDataExchange* pDX)
@@ -68,10 +100,25 @@ void CDllTestorDlg::DoDataExchange(CDataExchange* pDX)
 
 _tstring CDllTestorDlg::GetIniPath(const TCHAR* szFileExt /*= _T(".ini")*/)
 {
-	TCHAR chpath[MAX_PATH];
-	GetModuleFileName(NULL, chpath, sizeof(chpath));
+	std::vector<TCHAR> buffer(MAX_PATH, 0);
 
-	_tstring strModulePath = CMfcStrFile::CString2string(chpath);
+	DWORD dwLen = 0;
+	while ((dwLen = GetModuleFileName(NULL, buffer.data(), (DWORD)buffer.size())) != 0)
+	{
+		if (dwLen < (DWORD)buffer.size())
+		{
+			break;
+		}
+
+		buffer.resize(buffer.size() * 2);
+	}
+
+	if (dwLen == 0)
+	{
+		return _tstring();
+	}
+
+	_tstring strModulePath = CMfcStrFile::CString2string(buffer.data());
 	_tstring strIniPath = CStdStr::ReplaceSuffix(strModulePath, szFileExt);
 
 	return strIniPath;
@@ -80,7 +127,6 @@ _tstring CDllTestorDlg::GetIniPath(const TCHAR* szFileExt /*= _T(".ini")*/)
 bool CDllTestorDlg::IsProperSuffix(const _tstring& strFilePath, const std::vector<_tstring>& vSuffix)
 {
 	//包含所有文件
-	bool bGetAll = false;
 	size_t nFSNum = vSuffix.size();
 
 	for (size_t i = 0; i < nFSNum; ++i)
@@ -108,44 +154,77 @@ bool CDllTestorDlg::IsProperSuffix(const _tstring& strFilePath, const std::vecto
 
 int CDllTestorDlg::AddItemToList(_tstring stItemPath)
 {
-	std::vector<_tstring> vItems;
+	if (stItemPath.empty())
+	{
+		return m_listItems.GetItemCount();
+	}
+
+	//规范化路径作为去重key
+	TCHAR szFull[MAX_PATH] = {0};
+	_tstring stKey = stItemPath;
+	if (GetFullPathName(stItemPath.c_str(), MAX_PATH, szFull, NULL) > 0)
+	{
+		stKey = szFull;
+	}
+
+	//大小写不敏感去重
+	if (m_itemSet.find(stKey) != m_itemSet.end())
+	{
+		return m_listItems.GetItemCount();
+	}
+
+	bool bAllow = false;
+	if (m_eProcessMode == ProcessMode::File || m_eProcessMode == ProcessMode::Both)
+	{
+		if (CStdFile::IfAccessFile(stItemPath) && IsProperSuffix(stItemPath, m_cfg.vSuffixs))
+		{
+			bAllow = true;
+		}
+	}
+
+	if (!bAllow && (m_eProcessMode == ProcessMode::Dir || m_eProcessMode == ProcessMode::Both))
+	{
+		if (PathIsDirectory(stItemPath.c_str()))
+		{
+			bAllow = true;
+		}
+	}
+
+	if (bAllow)
+	{
+		int nPos = m_listItems.GetItemCount();
+		m_listItems.InsertItem(nPos, stItemPath.c_str());
+		m_itemSet.insert(stKey);
+	}
+
+	return m_listItems.GetItemCount();
+}
+
+bool CDllTestorDlg::ProcessFile(const _tstring& stSrcPath, const _tstring& stDstPath, config_s& _cfg)
+{
+	UNREFERENCED_PARAMETER(_cfg);
+	return CStdFile::CopyAFile(stSrcPath, stDstPath, false);
+}
+
+void CDllTestorDlg::RebuildItemSet()
+{
+	m_itemSet.clear();
+
 	int nItemNum = m_listItems.GetItemCount();
 	for (int i = 0; i < nItemNum; ++i)
 	{
 		CString strCurItem = m_listItems.GetItemText(i, 0);
 		_tstring stCurItem = CMfcStrFile::CString2string(strCurItem);
-		vItems.push_back(stCurItem);
+
+		TCHAR szFull[MAX_PATH] = {0};
+		_tstring stKey = stCurItem;
+		if (GetFullPathName(stCurItem.c_str(), MAX_PATH, szFull, NULL) > 0)
+		{
+			stKey = szFull;
+		}
+
+		m_itemSet.insert(stKey);
 	}
-
-	if (CStdTpl::VectorContains(vItems, stItemPath))
-	{
-		return nItemNum;
-	}
-
-#ifdef ITEM_ONLY_FILE
-	if (CStdFile::IfAccessFile(stItemPath) && IsProperSuffix(stItemPath, m_cfg.vSuffixs))
-	{
-		int nPos = m_listItems.GetItemCount();
-		m_listItems.InsertItem(nPos, stItemPath.c_str());
-	}
-#endif // ITEM_ONLY_FILE
-
-#ifdef ITEM_ONLY_DIR
-	if(PathIsDirectory(stItemPath.c_str()))
-	{
-		int nPos = m_listItems.GetItemCount();
-		m_listItems.InsertItem(nPos, stItemPath.c_str());
-	}
-#endif // ITEM_ONLY_DIR
-
-	return m_listItems.GetItemCount();
-}
-
-int CDllTestorDlg::ProcessFile(const _tstring& stSrcPath, const _tstring& stDstPath, config_s& _cfg)
-{
-	CStdFile::CopyAFile(stSrcPath, stDstPath, false);
-
-	return 0;
 }
 
 BEGIN_EASYSIZE_MAP(CDllTestorDlg)
@@ -167,6 +246,7 @@ BEGIN_MESSAGE_MAP(CDllTestorDlg, CDialogEx)
 	ON_WM_SYSCOMMAND()
 	ON_WM_PAINT()
 	ON_WM_QUERYDRAGICON()
+	ON_WM_DESTROY()
 	ON_BN_CLICKED(IDC_BUTTON_OPEN, &CDllTestorDlg::OnBnClickedButtonOpen)
 	ON_BN_CLICKED(IDC_BUTTON_BROWSE, &CDllTestorDlg::OnBnClickedButtonBrowse)
 	ON_BN_CLICKED(IDC_BUTTON_ADD_ITEMS, &CDllTestorDlg::OnBnClickedButtonAddItems)
@@ -211,18 +291,25 @@ BOOL CDllTestorDlg::OnInitDialog()
 	SetIcon(m_hIcon, TRUE);			// 设置大图标
 	SetIcon(m_hIcon, FALSE);		// 设置小图标
 
+	//支持文件拖拽
+	DragAcceptFiles(TRUE);
+	m_eDstDir.DragAcceptFiles(TRUE);
+
 	// TODO: 在此添加额外的初始化代码
-#ifdef ITEM_DIR_FILE
-	_tstring strItemName = _T("项目");
-#else
-
-#ifdef ITEM_ONLY_DIR
-	_tstring strItemName = _T("目录");
-#else
-	_tstring strItemName = _T("文件");
-#endif
-
-#endif
+	_tstring strItemName;
+	switch (m_eProcessMode)
+	{
+	case ProcessMode::File:
+	default:
+		strItemName = _T("文件");
+		break;
+	case ProcessMode::Dir:
+		strItemName = _T("目录");
+		break;
+	case ProcessMode::Both:
+		strItemName = _T("项目");
+		break;
+	}
 
 	//窗口名称
 	_tstring strWindowName = _T("项目处理");
@@ -282,43 +369,59 @@ BOOL CDllTestorDlg::OnInitDialog()
 	LPWSTR *argv=::CommandLineToArgvW(CStdStr::s2ws(::GetCommandLine()).c_str(),&argc);
 #endif
 
-	CStringArray arrCmds;
-	//去掉第一个程序自身的参数
-	for (int i = 1; i < argc; ++i)
+	if (argv != NULL)
 	{
-#ifdef _UNICODE
-		arrCmds.Add(argv[i]);
-#else
-		std::string sArc = CStdStr::ws2s(argv[i]);
-		arrCmds.Add(sArc.c_str());
-#endif
-	}
-	LocalFree(argv);
-
-	if (arrCmds.GetCount() >= 1)
-	{
-		int nItems = (int)arrCmds.GetCount();
-		CString strFiles, strDirs;
-		int nItemCount = 0;
-		for (int i = 0; i < nItems; ++i)
+		CStringArray arrCmds;
+		//去掉第一个程序自身的参数
+		for (int i = 1; i < argc; ++i)
 		{
-			CString strCurItem = arrCmds[i];
-			_tstring sItem = CMfcStrFile::CString2string(strCurItem);
-			if(PathFileExists(sItem.c_str()))
+#ifdef _UNICODE
+			arrCmds.Add(argv[i]);
+#else
+			std::string sArc = CStdStr::ws2s(argv[i]);
+			arrCmds.Add(sArc.c_str());
+#endif
+		}
+
+		if (arrCmds.GetCount() >= 1)
+		{
+			int nItems = (int)arrCmds.GetCount();
+			int nItemCount = 0;
+			for (int i = 0; i < nItems; ++i)
 			{
-				nItemCount = AddItemToList(sItem);
+				CString strCurItem = arrCmds[i];
+				_tstring sItem = CMfcStrFile::CString2string(strCurItem);
+				if(PathFileExists(sItem.c_str()))
+				{
+					nItemCount = AddItemToList(sItem);
+				}
+			}
+			CString strTmp[2];
+			strTmp[0].LoadString(IDS_PROCESS_NOW);
+			strTmp[1].LoadString(IDS_TIPS);
+			//文件和文件夹同时成立时才会执行，可根据需要修改
+			if (nItemCount && MessageBox(strTmp[0], strTmp[1], MB_YESNO) == IDYES)
+			{
+				OnBnClickedOk();
 			}
 		}
-		CString strTmp[2];
-		strTmp[0].LoadString(IDS_PROCESS_NOW);
-		strTmp[1].LoadString(IDS_TIPS);
-		//文件和文件夹同时成立时才会执行，可根据需要修改
-		if (nItemCount && MessageBox(strTmp[0], strTmp[1], MB_YESNO) == IDYES)
-		{
-			OnBnClickedOk();
-		}
+
+		LocalFree(argv);
 	}
 #endif // CMD_INPUT
+
+	//加载背景位图
+#ifdef DLG_BACKGROUND
+	_tstring stBgPath = GetIniPath(_T(".bmp"));
+	if (CStdFile::IfAccessFile(stBgPath))
+	{
+		m_hBgBitmap = (HBITMAP)LoadImage(AfxGetInstanceHandle(), stBgPath.c_str(), IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+	}
+	if (!m_hBgBitmap)
+	{
+		m_hBgBitmap = ::LoadBitmap(::GetModuleHandle(NULL), MAKEINTRESOURCE(IDB_BITMAP1));
+	}
+#endif // DLG_BACKGROUND
 
 #ifdef CMD_OUTPUT
 	SetCommandLine();
@@ -331,7 +434,8 @@ BOOL CDllTestorDlg::OnInitDialog()
 		m_cfg.nWindowWidth = 640;
 		m_cfg.nWindowHeight = 480;
 	}
-	SetWindowPos(&wndBottom,0,0,m_cfg.nWindowWidth,m_cfg.nWindowHeight, SWP_SHOWWINDOW);
+	SetWindowPos(NULL, 0, 0, m_cfg.nWindowWidth, m_cfg.nWindowHeight,
+		SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
 	CenterWindow();
 
 	return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE
@@ -386,6 +490,32 @@ HCURSOR CDllTestorDlg::OnQueryDragIcon()
 	return static_cast<HCURSOR>(m_hIcon);
 }
 
+void CDllTestorDlg::OnDestroy()
+{
+	CDialogEx::OnDestroy();
+
+#ifdef CMD_OUTPUT
+	ReleaseCommandLine();
+#endif
+}
+
+#ifdef CMD_OUTPUT
+int CDllTestorDlg::SetCommandLine()
+{
+	AllocConsole();
+	*stdin  = *( _fdopen(_open_osfhandle((intptr_t)::GetStdHandle(STD_INPUT_HANDLE), _O_TEXT), "r"));
+	*stdout = *( _fdopen(_open_osfhandle((intptr_t)::GetStdHandle(STD_OUTPUT_HANDLE), _O_TEXT), "wt"));
+	std::ios_base::sync_with_stdio();
+	return 0;
+}
+
+int CDllTestorDlg::ReleaseCommandLine()
+{
+	FreeConsole();
+	return 0;
+}
+#endif
+
 void CDllTestorDlg::OnBnClickedButtonOpen()
 {
 	// TODO: 在此添加控件通知处理程序代码
@@ -418,25 +548,26 @@ void CDllTestorDlg::OnBnClickedButtonBrowse()
 void CDllTestorDlg::OnBnClickedButtonAddItems()
 {
 	// TODO: 在此添加控件通知处理程序代码
-	int nPos = m_listItems.GetItemCount();
 	CStringArray arrItems;
-#if (defined ITEM_DIR_FILE) || (defined ITEM_ONLY_FILE)
 
-	size_t nCount = CMfcStrFile::OpenMultiFiles(arrItems, 0);
-
-#else
-	CString strDir = CMfcStrFile::BrowseDir();
-	arrItems.Add(strDir);
-	size_t nCount = arrItems.GetCount();
-#endif // 
-
-	if (nCount > 0)
+	if (m_eProcessMode == ProcessMode::File || m_eProcessMode == ProcessMode::Both)
 	{
-		for (size_t i = 0; i < nCount; ++i)
+		CMfcStrFile::OpenMultiFiles(arrItems, 0);
+	}
+	else
+	{
+		CString strDir = CMfcStrFile::BrowseDir();
+		if (strDir.GetLength() > 0)
 		{
-			_tstring stItem = CMfcStrFile::CString2string(arrItems[i]);
-			AddItemToList(stItem);
+			arrItems.Add(strDir);
 		}
+	}
+
+	INT_PTR nCount = arrItems.GetCount();
+	for (INT_PTR i = 0; i < nCount; ++i)
+	{
+		_tstring stItem = CMfcStrFile::CString2string(arrItems[i]);
+		AddItemToList(stItem);
 	}
 }
 
@@ -450,78 +581,76 @@ void CDllTestorDlg::OnBnClickedButtonDelItems()
 		m_listItems.DeleteItem(iSelItem);       
 		nPos = m_listItems.GetFirstSelectedItemPosition();
 	}
+	RebuildItemSet();
 }
 
 
 void CDllTestorDlg::OnDropFiles(HDROP hDropInfo)
 {
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
-	// 定义一个缓冲区来存放读取的文件名信息
-	TCHAR* szItemPath = nullptr;
 	const int nMaxPathLength = 2048;
-	CStdTpl::NewSafely(szItemPath, nMaxPathLength, true);
+	std::vector<TCHAR> szItemPath(nMaxPathLength, 0);
 	// 通过设置iFiles参数为0xFFFFFFFF,可以取得当前拖动的文件数量，
 	// 当设置为0xFFFFFFFF,函数间忽略后面两个参数。
 	UINT nNum = DragQueryFile(hDropInfo, 0xFFFFFFFF, NULL, 0);
 	// 通过循环依次取得拖动文件的File Name信息，并把它添加到ListBox中
 	for (UINT i = 0; i < nNum; ++i)
 	{
-		DragQueryFile(hDropInfo, i, szItemPath, nMaxPathLength);
-		if (PathFileExists(szItemPath) == TRUE)
+		DragQueryFile(hDropInfo, i, szItemPath.data(), nMaxPathLength);
+		if (PathFileExists(szItemPath.data()) == TRUE)
 		{
-			AddItemToList(CMfcStrFile::CString2string(szItemPath));
+			AddItemToList(CMfcStrFile::CString2string(szItemPath.data()));
 		}
 	}
 
 	// 结束此次拖拽操作，并释放分配的资源
-	CStdTpl::DelPointerSafely(szItemPath, true);
 	DragFinish(hDropInfo);
-
-	CDialogEx::OnDropFiles(hDropInfo);
 }
 
 BOOL CDllTestorDlg::OnEraseBkgnd(CDC* pDC)
 {
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
-	CDialogEx::OnEraseBkgnd(pDC);
 
-#ifdef DLG_BACKGROUND
-	HBITMAP hBitmap = nullptr;
+#ifndef DLG_BACKGROUND
+	return CDialogEx::OnEraseBkgnd(pDC);
+#else
 
-	//读取同名bmp文件
-	_tstring stBgPath = GetIniPath(_T(".bmp"));
-	if (CStdFile::IfAccessFile(stBgPath))
+	if (m_hBgBitmap)
 	{
-		hBitmap = (HBITMAP)LoadImage(AfxGetInstanceHandle(), stBgPath.c_str(), IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+		//获取位图尺寸
+		BITMAP bitmap;
+		GetObject(m_hBgBitmap, sizeof (BITMAP), &bitmap);
+
+		//获取对话框尺寸
+		CRect rect;
+		GetClientRect(&rect);
+
+		//创建DC
+		HDC hBkDC = ::CreateCompatibleDC(pDC->m_hDC);
+		if (hBkDC)
+		{
+			//选择位图并保存旧位图
+			HBITMAP hOldBitmap = (HBITMAP)::SelectObject(hBkDC, m_hBgBitmap);
+
+			//设置拉伸模式，避免拉伸后出现黑边
+			::SetStretchBltMode(pDC->m_hDC, HALFTONE);
+
+			//绘图
+			::StretchBlt(pDC->m_hDC, 0, 0, rect.Width(), rect.Height(), hBkDC, 0, 0, bitmap.bmWidth, bitmap.bmHeight, SRCCOPY);
+
+			//恢复旧位图并清理DC
+			::SelectObject(hBkDC, hOldBitmap);
+			::DeleteDC(hBkDC);
+		}
 	}
 	else
 	{
-		hBitmap = ::LoadBitmap(::GetModuleHandle(NULL), MAKEINTRESOURCE(IDB_BITMAP1));
+		CDialogEx::OnEraseBkgnd(pDC);
 	}
-
-	//获取位图尺寸
-	BITMAP bitmap;
-	GetObject(hBitmap, sizeof (BITMAP), &bitmap);
-
-	//获取对话框尺寸
-	CRect rect;
-	GetClientRect(&rect);
-
-	//创建DC
-	HDC m_hBkDC= ::CreateCompatibleDC(pDC->m_hDC);
-
-	//绘图并清理
-	if(hBitmap && m_hBkDC)
-	{
-		::SelectObject(m_hBkDC,hBitmap);
-		::StretchBlt(pDC->m_hDC, 0, 0, rect.Width(), rect.Height(),m_hBkDC,0,0,bitmap.bmWidth, bitmap.bmHeight, SRCCOPY);
-		::DeleteObject(hBitmap);
-		::DeleteDC(m_hBkDC);
-	}
-#endif // DLG_BACKGROUND
 
 	//这个很重要
 	return TRUE;
+#endif // DLG_BACKGROUND
 }
 
 BOOL CDllTestorDlg::OnHelpInfo(HELPINFO* pHelpInfo)
@@ -531,25 +660,39 @@ BOOL CDllTestorDlg::OnHelpInfo(HELPINFO* pHelpInfo)
 		_T("需要帮助"), MB_YESNO) == IDYES)
 	{
 		//已经复制到剪贴板
-		if(OpenClipboard())   
-		{   
-			_tstring source(_T("autumoon@vip.qq.com"));
-			HGLOBAL clipbuffer;   
-			char* buffer;   
-			EmptyClipboard();   
-			clipbuffer = GlobalAlloc(GMEM_DDESHARE,   source.size() + 1);   
-			buffer = (char*)GlobalLock(clipbuffer);   
+		CString strCopy(_T("autumoon@vip.qq.com"));
+		SIZE_T nBytes = (strCopy.GetLength() + 1) * sizeof(TCHAR);
+		HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, nBytes);
+if (hMem != NULL)
+		{
+			LPTSTR lpBuffer = (LPTSTR)GlobalLock(hMem);
+			if (lpBuffer == NULL)
+			{
+				GlobalFree(hMem);
+				return TRUE;
+			}
+
+			memcpy(lpBuffer, strCopy.GetString(), nBytes);
+			GlobalUnlock(hMem);
+
+			if (!::OpenClipboard(m_hWnd))
+			{
+				GlobalFree(hMem);
+				return TRUE;
+			}
+
+			EmptyClipboard();
 #ifdef _UNICODE
-			std::string sSrc = CStdStr::ws2s(source);
+			if (SetClipboardData(CF_UNICODETEXT, hMem) == NULL)
 #else
-			std::string sSrc(source);
+			if (SetClipboardData(CF_TEXT, hMem) == NULL)
 #endif // _UNICODE
-			strcpy_s(buffer, source.size() + 1, sSrc.c_str());
-			GlobalUnlock(clipbuffer);   
-			SetClipboardData(CF_TEXT,clipbuffer);   
+			{
+				GlobalFree(hMem);
+			}
 			CloseClipboard();
 			MessageBox(_T("“autumoon@vip.qq.com”\n  已经成功复制到剪贴板！"), _T("地址复制完成!"), MB_ICONINFORMATION);
-		}   
+		}
 	}
 
 	return TRUE;
@@ -562,6 +705,7 @@ void CDllTestorDlg::OnBnClickedButtonClearItems()
 	{
 		m_listItems.DeleteAllItems();
 	}
+	m_itemSet.clear();
 }
 
 void CDllTestorDlg::OnBnClickedOk()
@@ -584,16 +728,25 @@ void CDllTestorDlg::OnBnClickedOk()
 	}
 
 	std::vector<_tstring> vItems;
-	int nItemCount = m_listItems.GetItemCount();
-	for (int i = 0; i < nItemCount; ++i)
+	const size_t nListCount = (size_t)m_listItems.GetItemCount();
+	vItems.reserve(nListCount);
+	for (size_t i = 0; i < nListCount; ++i)
 	{
-		CString strCurItem = m_listItems.GetItemText(i, 0);
+		CString strCurItem = m_listItems.GetItemText((int)i, 0);
 		_tstring stCurItem = CMfcStrFile::CString2string(strCurItem);
 		vItems.push_back(stCurItem);
 	}
 
+	//若没有添加任何待处理文件则提示并返回
+	if (vItems.empty())
+	{
+		AfxMessageBox(_T("请先添加待处理文件"));
+		return;
+	}
+
+	const size_t nItemCount = vItems.size();
 	_tstring stDstDir = CMfcStrFile::CString2string(strDstDir);
-	if (vItems.size() == 0 || !CStdDir::IfAccessDir(stDstDir) && !CStdDir::CreateDir(stDstDir))
+	if (!CStdDir::IfAccessDir(stDstDir) && !CStdDir::CreateDir(stDstDir))
 	{
 		return;
 	}
@@ -607,53 +760,108 @@ void CDllTestorDlg::OnBnClickedOk()
 	//开始显示进度
 	CTaskBarProgress tbp(m_hWnd);
 	CProgressInterface* ppi = &tbp;
-	ppi->Start();
+	CProgressGuard guard(&tbp);
 	CElapsedTime et;
 
-	//记录日志
-	//CLOG::Out(_T("%s"), _T("start task!"));
-	//记录耗时
-	et.Begin();
-	/*********************************这里增加主程序 开始***************************************/
-	//处理所有项目，推荐判断项目是否存在
-	stDstDir = CStdStr::AddSlashIfNeeded(stDstDir);
-	for (size_t i = 0; i < nItemCount; ++i)
+	int nSuccess = 0, nFail = 0;
+
+	try
 	{
-		const _tstring stCurItem = vItems[i];
-		const _tstring stDstItem = stDstDir + CStdStr::GetNameOfFile(stCurItem);
-
-#ifdef ITEM_ONLY_FILE
-		if (CStdFile::IfAccessFile(stCurItem) && IsProperSuffix(stCurItem, m_cfg.vSuffixs))
+		//记录日志
+		//CLOG::Out(_T("%s"), _T("start task!"));
+		//记录耗时
+		et.Begin();
+		/*********************************这里增加主程序 开始***************************************/
+		//处理所有项目，推荐判断项目是否存在
+		stDstDir = CStdStr::AddSlashIfNeeded(stDstDir);
+		for (size_t i = 0; i < nItemCount; ++i)
 		{
-			ProcessFile(stCurItem, stDstItem, m_cfg);
-		}
-#endif // ITEM_ONLY_FILE
+			const _tstring stCurItem = vItems[i];
+			const _tstring stDstItem = stDstDir + CStdStr::GetNameOfFile(stCurItem);
 
-#ifdef ITEM_ONLY_DIR
-		//如果是目录
-		if(PathIsDirectory(stCurItem.c_str()))
-		{
-			//处理文件夹
-			std::vector<_tstring> vSubFiles;
-			size_t nSubFileCount = getFiles(stCurItem, vSubFiles, m_cfg.vSuffixs, true);
-
-			for (int j = 0; j < nSubFileCount; ++j)
+			if (m_eProcessMode == ProcessMode::File || m_eProcessMode == ProcessMode::Both)
 			{
-				_tstring stSubSrcFile = vSubFiles[j];
-				_tstring strSubDstFile = CStdStr::AddSlashIfNeeded(stDstItem) + stSubSrcFile.substr(CStdStr::AddSlashIfNeeded(stCurItem).length());
-				_tstring strSubDir = CStdStr::GetDirOfFile(strSubDstFile);
-				if (!CStdDir::IfAccessDir(strSubDir) && !CStdDir::CreateDir(strSubDir))
+				if (CStdFile::IfAccessFile(stCurItem) && IsProperSuffix(stCurItem, m_cfg.vSuffixs))
 				{
-					continue;
+					if (ProcessFile(stCurItem, stDstItem, m_cfg))
+					{
+						++nSuccess;
+					}
+					else
+					{
+						++nFail;
+					}
 				}
-				ProcessFile(stSubSrcFile, strSubDstFile, m_cfg);
 			}
-		}
-#endif // ITEM_ONLY_DIR
 
-		ppi->SetProgressValue(i + 1, nItemCount);
+			if (m_eProcessMode == ProcessMode::Dir || m_eProcessMode == ProcessMode::Both)
+			{
+				//如果是目录
+				if (PathIsDirectory(stCurItem.c_str()))
+				{
+					//处理文件夹
+					std::vector<_tstring> vSubFiles;
+					size_t nSubFileCount = getFiles(stCurItem, vSubFiles, m_cfg.vSuffixs, true);
+
+					for (size_t j = 0; j < nSubFileCount; ++j)
+					{
+						_tstring stSubSrcFile = vSubFiles[j];
+						TCHAR szRelative[MAX_PATH] = {0};
+						if (PathRelativePathTo(szRelative,
+							stCurItem.c_str(),
+							FILE_ATTRIBUTE_DIRECTORY,
+							stSubSrcFile.c_str(),
+							FILE_ATTRIBUTE_NORMAL))
+						{
+							_tstring stRel = szRelative;
+							if (stRel.size() >= 2 && stRel[0] == _T('.') &&
+								(stRel[1] == _T('\\') || stRel[1] == _T('/')))
+							{
+								stRel = stRel.substr(2);
+							}
+							_tstring strSubDstFile = CStdStr::AddSlashIfNeeded(stDstItem) + stRel;
+							_tstring strSubDir = CStdStr::GetDirOfFile(strSubDstFile);
+							if (!CStdDir::IfAccessDir(strSubDir) && !CStdDir::CreateDir(strSubDir))
+							{
+								++nFail;
+								continue;
+							}
+							if (ProcessFile(stSubSrcFile, strSubDstFile, m_cfg))
+							{
+								++nSuccess;
+							}
+							else
+							{
+								++nFail;
+							}
+						}
+						else
+						{
+							++nFail;
+						}
+					}
+				}
+			}
+
+			ppi->SetProgressValue((int)(i + 1), (int)nItemCount);
+		}
+		/*********************************这里增加主程序 结束***************************************/
 	}
-	/*********************************这里增加主程序 结束***************************************/
+	catch (CException* e)
+	{
+		e->Delete();
+		AfxMessageBox(_T("处理过程中发生 MFC 异常"));
+	}
+	catch (std::exception& e)
+	{
+		CString str;
+		str.Format(_T("处理过程中发生异常：%S"), e.what());
+		AfxMessageBox(str);
+	}
+	catch (...)
+	{
+		AfxMessageBox(_T("处理过程中发生未知异常"));
+	}
 
 	//结束耗时
 	int nMin = 0, nSecond = 0, nMilliSecond = 0;
@@ -663,16 +871,16 @@ void CDllTestorDlg::OnBnClickedOk()
 	//CLOG::Out(_T("This task costs %d min %d second %d millisecond!"), nMin, nSecond, nMilliSecond);
 	//CLOG::End();
 
-	//结束进度显示
-	ppi->End();
 	FlashWindow(TRUE);
 
 #ifdef DLG_ELAPSED_TIME
 	CString strTips;
-	strTips.Format(_T("本次耗时 %d分%d秒%d毫秒!"), nMin, nSecond, nMilliSecond);
+	strTips.Format(_T("本次耗时 %d分%d秒%d毫秒!\n成功 %d 个，失败 %d 个"), nMin, nSecond, nMilliSecond, nSuccess, nFail);
 	AfxMessageBox(strTips);
 #else
-	AfxMessageBox(IDS_PROCESS_OVER);
+	CString strTips;
+	strTips.Format(_T("处理完成!\n成功 %d 个，失败 %d 个"), nSuccess, nFail);
+	AfxMessageBox(strTips);
 #endif // DLG_ELAPSED_TIME
 }
 
@@ -689,7 +897,7 @@ void CDllTestorDlg::OnSize(UINT nType, int cx, int cy)
 	if (pWnd)
 	{
 		pWnd->GetWindowRect(&rcList);
-		m_listItems.SetColumnWidth(0, max(10, rcList.Width() - 6));
+		m_listItems.SetColumnWidth(0, std::max(10, rcList.Width() - 6));
 	}
 
 	if (nType != SIZE_MINIMIZED)
@@ -697,7 +905,10 @@ void CDllTestorDlg::OnSize(UINT nType, int cx, int cy)
 		CRect rcDlg;
 		GetClientRect(rcDlg);
 		InvalidateRect(rcDlg);
-		m_cfg.nWindowWidth = cx;
-		m_cfg.nWindowHeight = cy;
+		//记录窗口整体大小（含标题栏和边框）
+		CRect rcWnd;
+		GetWindowRect(&rcWnd);
+		m_cfg.nWindowWidth = rcWnd.Width();
+		m_cfg.nWindowHeight = rcWnd.Height();
 	}
 }
